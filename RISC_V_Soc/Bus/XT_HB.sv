@@ -1,0 +1,160 @@
+//----------高速总线控制器----------//
+// 总线通过输入的地址来判断要选中的设备
+// 主设备不发出片选信号
+// 总线请求使用轮询机制，发生死锁时重置到0，可以看作0号主机优先级较高
+// 0.1更新 移除单独的读/写使能扇出
+// 0.2更新 整合总线信号为结构体
+// 0.3更新 轮询仲裁器，完全ACK访问，读/写独立，地址域映射
+// 0.4更新 放弃旧的地址域映射，使用设备识别符+地址偏移的MMIO
+// 0.5更新 使用接口作为总线信号
+// 0.6更新 去除嵌套接口的使用
+module XT_HB #(
+    parameter int ADDR_WIDTH = 16,
+    parameter int ID_WIDTH = 3,
+    parameter int MASTER_COUNT = 1,  // 总线上主设备的数量
+    parameter int DEVICE_COUNT = 2,  // 总线上IO设备的数量
+    // 设备基准识别符，从0开始划分地址空间(所以0不用填)
+    parameter bit [ID_WIDTH-1:0] DEVICE_BASE_ID[DEVICE_COUNT-1]
+) (
+    input clk,
+    input rst,
+
+    memory_direct_if.slave master    [MASTER_COUNT],
+    xt_hbus_rsp_if.bus     rsp_master[MASTER_COUNT],
+    xt_hbus_if.bus         devices   [DEVICE_COUNT]
+);
+
+  // 提前声明
+  logic [31:0] hb_rdata;
+
+  //----------解包接口----------//
+  // 访问接口数组必须使用“常量”，循环变量i都不行
+  // 所以必须解包成结构体
+  typedef struct packed {
+    logic read, write;
+    logic [1:0] read_size, write_size;
+    logic [ADDR_WIDTH-1:0] raddr, waddr;
+    logic [31:0] wdata;
+  } master_in_t;
+  master_in_t master_in[MASTER_COUNT];
+  generate
+    for (genvar i = 0; i < MASTER_COUNT; ++i) begin : gen_unpack_if
+      assign master_in[i].read = master[i].read;
+      assign master_in[i].write = master[i].write;
+      assign master_in[i].read_size = master[i].read_size;
+      assign master_in[i].write_size = master[i].write_size;
+      assign master_in[i].raddr = master[i].raddr[ADDR_WIDTH-1:0];
+      assign master_in[i].waddr = master[i].waddr[ADDR_WIDTH-1:0];
+      assign master_in[i].wdata = master[i].wdata;
+      assign master[i].rdata = hb_rdata;
+    end
+  endgenerate
+
+
+  //----------访问等待控制器----------//
+  logic [MASTER_COUNT-1:0] read_req, write_req;
+  logic [MASTER_COUNT-1:0] read_grant, write_grant;
+
+  logic read_finished, write_finished;  // 提前声明
+  wire [MASTER_COUNT-1:0] read_rsp = {MASTER_COUNT{read_finished}};
+  wire [MASTER_COUNT-1:0] write_rsp = {MASTER_COUNT{write_finished}};
+  logic [MASTER_COUNT-1:0] read_stall, write_stall, stall_req;
+  always_comb begin
+    read_stall  = (read_req & ~read_grant) | (read_req & ~read_rsp);
+    write_stall = (write_req & ~write_grant) | (write_req & ~write_rsp);
+    stall_req   = read_stall | write_stall;
+  end
+  generate
+    for (genvar i = 0; i < MASTER_COUNT; ++i) begin : gen_rsp_if
+      assign rsp_master[i].read_grant  = read_grant[i];
+      assign rsp_master[i].write_grant = write_grant[i];
+      assign rsp_master[i].read_stall  = read_stall[i];
+      assign rsp_master[i].write_stall = write_stall[i];
+      assign rsp_master[i].stall_req   = stall_req[i];
+    end
+  endgenerate
+
+
+  //----------总线仲裁器和控制器----------//
+  localparam int unsigned REQ_IDX_WIDTH = (MASTER_COUNT == 1) ? 1 : $clog2(MASTER_COUNT);
+  always_comb begin
+    for (int i = 0; i < MASTER_COUNT; ++i) begin
+      read_req[i]  = master_in[i].read;
+      write_req[i] = master_in[i].write;
+    end
+  end
+  logic [REQ_IDX_WIDTH-1:0] read_grant_idx, write_grant_idx;
+  XT_HB_Arbiter #(.REQ_COUNT(MASTER_COUNT)) u_XT_BusArbiter (.*);
+
+  // 主设备总线复用器
+  logic hb_ren, hb_wen;
+  logic [ADDR_WIDTH-1:0] raddr_mux, waddr_mux;
+  logic [1:0] read_size_mux, write_size_mux;
+  logic [31:0] wdata_mux;
+  always_comb begin
+    // 读通道复用器
+    hb_ren = master_in[read_grant_idx].read;
+    raddr_mux = master_in[read_grant_idx].raddr;
+    read_size_mux = master_in[read_grant_idx].read_size;
+
+    // 写通道复用器
+    hb_wen = master_in[write_grant_idx].write;
+    waddr_mux = master_in[write_grant_idx].waddr;
+    write_size_mux = master_in[write_grant_idx].write_size;
+    wdata_mux = master_in[write_grant_idx].wdata;
+  end
+
+
+
+  // 片选生成
+  localparam int OFFSET_WIDTH = ADDR_WIDTH - ID_WIDTH;
+  localparam int SEL_IDX_WIDTH = (DEVICE_COUNT == 1) ? 1 : $clog2(DEVICE_COUNT);
+  logic [DEVICE_COUNT-1:0] sel[2];
+  logic [SEL_IDX_WIDTH-1:0] sel_idx[2];
+  wire [ID_WIDTH-1:0] raddr_mux_id = raddr_mux[OFFSET_WIDTH+:ID_WIDTH];
+  wire [ID_WIDTH-1:0] waddr_mux_id = waddr_mux[OFFSET_WIDTH+:ID_WIDTH];
+  SelectDecoder #(
+      .ID_WIDTH(ID_WIDTH),
+      .ADDR_COUNT(2),
+      .DEVICE_COUNT(DEVICE_COUNT),
+      .BASE_ID(DEVICE_BASE_ID)
+  ) u_MMIO (
+      .device_id('{raddr_mux_id, waddr_mux_id}),
+      .sel(sel),
+      .sel_idx(sel_idx)
+  );
+  wire [DEVICE_COUNT-1:0] slave_rsel = hb_ren ? sel[0] : 0;
+  wire [DEVICE_COUNT-1:0] slave_wsel = hb_wen ? sel[1] : 0;
+
+
+
+  // 读写等待控制
+  logic [DEVICE_COUNT-1:0] read_finish, write_finish;
+  assign read_finished  = hb_ren ? ((read_finish & slave_rsel) != 0) : 1;
+  assign write_finished = hb_wen ? ((write_finish & slave_wsel) != 0) : 1;
+
+
+  // IO设备总线复用器
+  logic [31:0] device_data[DEVICE_COUNT];
+  assign hb_rdata = device_data[sel_idx[0]];
+
+
+  generate
+    for (genvar i = 0; i < DEVICE_COUNT; ++i) begin : gen_device_link
+      assign devices[i].clk = clk;
+      assign devices[i].rst = rst;
+      assign devices[i].read_size = read_size_mux;
+      assign devices[i].write_size = write_size_mux;
+      assign devices[i].raddr = raddr_mux;
+      assign devices[i].waddr = waddr_mux;
+      assign devices[i].wdata = wdata_mux;
+      assign devices[i].ren = slave_rsel[i];
+      assign devices[i].wen = slave_wsel[i];
+
+      assign device_data[i] = devices[i].rdata;
+      assign read_finish[i] = devices[i].read_finish;
+      assign write_finish[i] = devices[i].write_finish;
+    end
+  endgenerate
+
+endmodule
