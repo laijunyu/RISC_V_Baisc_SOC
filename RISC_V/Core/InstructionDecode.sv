@@ -140,6 +140,10 @@ module InstructionDecode
               id_out.operand1=read_rs1.data;
               id_out.operand2=read_rs2.data;
           end
+          default :begin
+            id_exception.raise = 1;
+            id_exception.code=ILLEGAL_INST;
+          end
         endcase
       end
       RV32I_OP_SYSTEM: begin

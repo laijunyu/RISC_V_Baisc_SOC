@@ -73,8 +73,67 @@ module InstructionExecute
   // 低 64 位就是完整 32×32 乘积（低半与符号无关）
   wire [63:0] alu_multiply = prod_full[63:0];
   // 乘法器占位符end
-  //todo 除法器
-  wire alu_division [31:0];
+  // ═══════════════════════════════════════════════════════════════
+  //  M 扩展除法数据通路（EX 模块内，模块级 wire + assign）
+  // ═══════════════════════════════════════════════════════════════
+
+  // ── 输入线（来自 EX 现有信号）────────────────────────────────
+  //   operand1 ← EX 的 rs1 数据（原 op1）
+  //   operand2 ← EX 的 rs2 数据（原 op2）
+  //   funct3   ← 指令 funct3[2:0]
+
+  // ── ① 两位解码线：funct3[1:0] 替代 4 路 case ──────────────────
+  wire is_rem = funct3[1];  // 源: funct3[1] → 目的: a/b 选择、do_neg 门控、signed_overflow 门控
+  wire is_uns = funct3[0];  // 源: funct3[0] → 目的: raw 选择、neg 选择、zero_res/ovf_res
+
+  // ── ② 绝对值化线：有符号取位模式绝对值，无符号直通 ────────────
+  wire [CFG.XLEN-1:0] a = is_uns ? operand1
+                                : (operand1[CFG.XLEN-1] ? (~operand1 + 1'b1) : operand1);
+  //   源: operand1, is_uns → 目的: 除法器被除数输入
+  wire [CFG.XLEN-1:0] b = is_uns ? operand2
+                                : (operand2[CFG.XLEN-1] ? (~operand2 + 1'b1) : operand2);
+  //   源: operand2, is_uns → 目的: 除法器除数输入（经 b_safe）
+
+  // ── ③ 除数消毒线：除零置 1，防 / % 产生 x ─────────────────────
+  wire [CFG.XLEN-1:0] b_safe = (b == '0) ? {{(CFG.XLEN-1){1'b0}}, 1'b1} : b;
+  //   源: b → 目的: q_mag/r_mag 的除数端口
+
+  // ── ④ 唯一一套无符号除法核心 ─────────────────────────────────
+  wire [CFG.XLEN-1:0] q_mag = a / b_safe;   // 源: a, b_safe → 目的: raw(商路径)
+  wire [CFG.XLEN-1:0] r_mag = a % b_safe;   // 源: a, b_safe → 目的: raw(余数路径)
+
+  // ── ⑤ 商/余选择线 ────────────────────────────────────────────
+  wire [CFG.XLEN-1:0] raw = is_rem ? r_mag : q_mag;
+  //   源: q_mag, r_mag, is_rem → 目的: raw_sgn
+
+  // ── ⑥ 符号修正线 ─────────────────────────────────────────────
+  wire neg    = is_rem ? operand1[CFG.XLEN-1]
+                      : (operand1[CFG.XLEN-1] ^ operand2[CFG.XLEN-1]);
+  //   源: operand1[MSB], operand2[MSB], is_rem → 目的: do_neg
+  wire do_neg = ~is_uns & neg;
+  //   源: neg, is_uns → 目的: raw_sgn 的取反使能
+  wire [CFG.XLEN-1:0] raw_sgn = do_neg ? (~raw + 1'b1) : raw;
+  //   源: raw, do_neg → 目的: 三路覆盖的正常路径
+
+  // ── ⑦ 边界条件线 ─────────────────────────────────────────────
+  wire div_by_zero     = (operand2 == '0);
+  //   源: operand2 → 目的: 三路覆盖最高优先级
+  wire signed_overflow = ~is_uns &&
+                        (operand1 == {1'b1, {(CFG.XLEN-1){1'b0}}}) &&   // INT_MIN
+                        (operand2 == {CFG.XLEN{1'b1}});                 // -1
+  //   源: operand1, operand2, is_uns → 目的: 三路覆盖第二优先级
+
+  // ── ⑧ 覆盖值线：按 RISC-V 规范构造默认结果 ────────────────────
+  wire [CFG.XLEN-1:0] zero_res = is_rem ? operand1 : {CFG.XLEN{1'b1}};
+  //   源: operand1, is_rem → 目的: div_by_zero 时的输出（余=operand1, 商=全1）
+  wire [CFG.XLEN-1:0] ovf_res  = is_rem ? '0 : operand1;
+  //   源: operand1, is_rem → 目的: signed_overflow 时的输出（余=0, 商=INT_MIN）
+
+  // ── ⑨ 最终输出线：三路覆盖，优先级 除零 > 溢出 > 正常 ─────────
+  wire [CFG.XLEN-1:0] div_result = div_by_zero     ? zero_res  :
+                                  signed_overflow ? ovf_res   :
+                                                    raw_sgn;
+  //   源: zero_res, ovf_res, raw_sgn → 目的: EX 的 case 分支 rd
 
   wire alu_equal = operand1 == operand2;
   // 优化比较器，共用资源
@@ -178,16 +237,11 @@ module InstructionExecute
             RV32M_MULH, RV32M_MULHSU , RV32M_MULHU:begin
               write_rd.data=alu_multiply[63:32];
             end
-            RV32M_DIV:begin
+            RV32M_DIV,RV32M_DIVU, RV32M_REM,RV32M_REMU:begin
+              write_rd.data=div_result;
             end
-            RV32M_DIVU:begin
-            end
-            RV32M_REM:begin
-            end
-            RV32M_REMU:begin
-            end
+            default: ;
             endcase
-            //TODO 做具体的unique判断func3是高位地位是乘还是除
           end
           RV32I_OP_R_FUNC7:begin
             unique case (funct3)
@@ -207,6 +261,7 @@ module InstructionExecute
                   write_rd.data = alu_shift_right_l;
                 end
               end
+              default: ;
             endcase
           end
           RV32I_OP_R_FUNC7_2 : begin
@@ -227,8 +282,10 @@ module InstructionExecute
                   write_rd.data = alu_shift_right_l;
                 end
               end
+              default: ;
             endcase
           end
+        default: ;
         endcase
       end
       RV32I_OP_SYSTEM: begin
