@@ -10,6 +10,8 @@ module CoreCtrl
     // 来自外部控制
     input [STALL_REQ_COUNT-1:0] stall_req,
 
+
+    input div_stall,// 除法多周期停顿请求
     // 来自指令执行模块
     input [31:0] jump_addr_ex,
     input jump_en_ex,
@@ -82,7 +84,7 @@ module CoreCtrl
 
   //----------核心暂停控制----------//
   wire waiting_int = wfi && !trap.any_int_come && !debug.bypass_wfi;
-  wire any_stall_req = |stall_req;
+  wire any_stall_req = |stall_req||div_stall;
   always_comb begin
     stall_n = !(any_stall_req || waiting_int || debug.halted);
   end

@@ -6,6 +6,7 @@ module ID_EX
     input rst,
     input flush,
     input stall_n,
+    output busy_out,//专门用于除法等待
 
     instruction_if.from_prev if_id_inst,
     instruction_if.to_next   id_ex_inst,
@@ -68,5 +69,23 @@ module ID_EX
     end
   end
 
+  reg busy;//忙位
+  reg [1:0]conter;//除法时的计数器
+  always_ff @(posedge clk) begin
+  if (rst) begin
+    busy <= 0; conter <= 0;
+  end else if (if_id_inst.inst[6:0]==7'b0110011&&if_id_inst.inst[31:25]==7'b0000001&&if_id_inst.inst[14]==1'b1 && !busy) begin
+    busy <= 1; conter <= 0;          // 启动:conter 从 0 开始(不要在启动拍就+1)
+  end else if (busy) begin
+    if (conter == 2'd1) begin        // 数够 1 拍(启动拍+这拍=2拍)
+      busy <= 0; conter <= 0;
+    end else begin
+      conter <= conter + 1;
+    end
+  end
+end
+
+  assign busy_out =busy;
+//简单计时器多算一拍，让流水线停顿，除法器算完
 
 endmodule

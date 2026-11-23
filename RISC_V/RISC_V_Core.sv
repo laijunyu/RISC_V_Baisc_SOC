@@ -116,8 +116,12 @@ module RISC_V_Core
   id_to_ex_if #(.XLEN(XLEN)) id_out ();
   InstructionDecode #(.CFG(CFG)) u_InstructionDecode (.*);
 
+  wire div_busy;
   id_to_ex_if #(.XLEN(XLEN)) id_ex_out ();
-  ID_EX u_ID_EX (.*);
+  ID_EX u_ID_EX (.*,.busy_out(div_busy));
+  wire div_stall;
+  assign div_stall = div_busy;
+
 
   // 目前译码和执行不平衡（执行高占用），某些信号可以在Decode中提前提取
   wire [31:0] jump_addr_ex;
